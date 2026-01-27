@@ -1,0 +1,412 @@
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+using System.Collections.Generic;
+using System.Numerics; 
+using System.Threading.Tasks;
+using System.IO;
+using Thirdweb;
+using Thirdweb.Unity;
+using UnityEngine.Networking;
+using Firebase;
+using Firebase.Database;
+using Firebase.Extensions;
+
+// --- STRUCT DATA ---
+[System.Serializable]
+public struct ClaimProof
+{
+    public string[] proof;
+    public string quantityLimitPerWallet;
+    public string pricePerToken;
+    public string currency;
+}
+
+[System.Serializable]
+public class QuestionData
+{
+    [TextArea]
+    public string question;
+    public string[] answers;
+    public int correctAnswer; // Index jawaban benar (0-3)
+}
+
+public class GameManager : MonoBehaviour
+{
+    [Header("NFT Settings")]
+    public string contractAddress = "0x######################";
+    public string chainId = "11155111"; // Sepolia
+    public string tokenId = "0";
+
+    [Header("Certificate Settings")]
+    public Sprite certificateSprite;
+
+    [Header("UI Panels")]
+    public GameObject uiCamera;
+    public GameObject gameWorld;
+    public GameObject uiPanel;         // Ini Panel Menu Utama (Video & Kuis)
+    public GameObject quizPanel;       // Ini Panel Container Kuis
+    public GameObject certificatePanel;
+
+    [Header("Quiz Elements")]
+    public Button startQuizButton;
+    public TextMeshProUGUI questionText;
+    public Button[] answerButtons;     // Ini Tombol A-D
+    public TextMeshProUGUI statusText;
+    public TextMeshProUGUI scoreText;
+    public Button backButton;
+
+    [Header("Certificate Elements")]
+    public Image certImageDisplay;
+    public Button closeButton;
+    public Button downloadButton;
+    public TextMeshProUGUI answerKeyText; 
+
+    [Header("Video Settings")]
+    public Button videoButton;
+    private string youtubeLink = "https://youtu.be/rt63X2j4Lis?si=G276EJX9uv2k2iqx";
+
+    // Internal Variables
+    private List<QuestionData> questions = new List<QuestionData>();
+    private int currentQuestionIndex = 0;
+    private int score = 0;
+    private string walletAddress = "";
+    private int[] userAnswers;
+    
+    // Firebase
+    private DatabaseReference dbReference;
+    private bool isFirebaseReady = false;
+    private string databaseURL = "https://game##########.firebaseio.com/";
+
+    // Control
+    private bool isMonitoringWallet = false;
+
+    void Start()
+    {
+        // 1. Setup Awal UI
+        if (uiCamera) uiCamera.SetActive(true);
+        if (gameWorld) gameWorld.SetActive(false);
+        if (uiPanel) uiPanel.SetActive(false);
+        if (quizPanel) quizPanel.SetActive(false);
+        if (certificatePanel) certificatePanel.SetActive(false);
+        if (scoreText) scoreText.gameObject.SetActive(false);
+        
+        if (answerKeyText) { answerKeyText.text = ""; answerKeyText.gameObject.SetActive(false); }
+
+        // 2. Inisialisasi System
+        InitializeFirebase();
+        MonitorWalletConnection();
+        SetupButtonListeners();
+        LoadHardcodedQuestions();
+        LockCursor();
+    }
+
+    private void SetupButtonListeners()
+    {
+        if (closeButton) closeButton.onClick.AddListener(CloseCertificatePanel);
+        if (downloadButton) downloadButton.onClick.AddListener(OnDownloadButtonClicked);
+
+        if (startQuizButton) startQuizButton.onClick.AddListener(CheckBalanceAndStart);
+        if (videoButton) videoButton.onClick.AddListener(OpenVideoLink);
+        
+        if (backButton) backButton.onClick.AddListener(OnBackButtonClicked);
+
+        for (int i = 0; i < answerButtons.Length; i++)
+        {
+            int index = i;
+            answerButtons[index].onClick.AddListener(() => OnAnswerSelected(index));
+        }
+    }
+
+    private void OnDestroy()
+    {
+        isMonitoringWallet = false;
+    }
+
+    // --- LOGIKA UTAMA: DOWNLOAD & CLAIM ---
+    public void OnDownloadButtonClicked()
+    {
+        if (downloadButton) downloadButton.interactable = false;
+        DownloadCertificateImage();
+        ClaimNFT();
+    }
+
+    public async void ClaimNFT()
+    {
+        UpdateStatus("Menyiapkan Transaksi...");
+        try
+        {
+            var wallet = ThirdwebManager.Instance.GetActiveWallet();
+            var address = await wallet.GetAddress();
+            var contract = await ThirdwebManager.Instance.GetContract(contractAddress, BigInteger.Parse(chainId));
+
+            ClaimProof proofData = new ClaimProof
+            {
+                proof = new string[0],
+                quantityLimitPerWallet = "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                pricePerToken = "0",
+                currency = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+            };
+
+            var transaction = await contract.Prepare(
+                wallet,      
+                "claim",     
+                0,           
+                new object[] 
+                {
+                    address, BigInteger.Parse(tokenId), 1, "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE", 0, proofData, new byte[0]
+                }
+            );
+
+            UpdateStatus("Cek Wallet untuk Konfirmasi!");
+            await ThirdwebTransaction.SendAndWaitForTransactionReceipt(transaction);
+            UpdateStatus("Sukses! NFT Masuk Wallet.");
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError("Gagal Claim: " + e); 
+            if (e.Message.Contains("user rejected")) UpdateStatus("Transaksi Dibatalkan.");
+            else UpdateStatus("Gagal Claim. Cek Console.");
+        }
+        if (downloadButton) downloadButton.interactable = true;
+    }
+
+    // --- DOWNLOAD GAMBAR KE GALERI ---
+    public void DownloadCertificateImage()
+    {
+        string ipfsUrl = "ipfs://#########################E/0.jpg"; 
+        string finalUrl = ipfsUrl.Replace("ipfs://", "https://gateway.pinata.cloud/ipfs/");
+        StartCoroutine(DownloadImageFromUrl(finalUrl, "Sertifikat_Kuis_Kimia"));
+    }
+
+    System.Collections.IEnumerator DownloadImageFromUrl(string url, string fileNameBase)
+    {
+        UpdateStatus("Sedang Mendownload...");
+        using (UnityWebRequest uwr = UnityWebRequestTexture.GetTexture(url))
+        {
+            yield return uwr.SendWebRequest();
+
+            if (uwr.result == UnityWebRequest.Result.Success)
+            {
+                Texture2D texture = DownloadHandlerTexture.GetContent(uwr);
+                if (!texture.isReadable)
+                {
+                    Texture2D readableText = new Texture2D(texture.width, texture.height, texture.format, false);
+                    readableText.ReadPixels(new Rect(0, 0, texture.width, texture.height), 0, 0);
+                    readableText.Apply();
+                    texture = readableText;
+                }
+
+                byte[] bytes = texture.EncodeToPNG();
+                string fileName = fileNameBase + "_" + System.DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".png";
+
+                #if UNITY_ANDROID && !UNITY_EDITOR
+                    NativeGallery.SaveImageToGallery(bytes, "MetaEdu Certificate", fileName, (success, path) =>
+                    {
+                        if (success) UpdateStatus("Sukses! Cek Galeri HP Anda.");
+                        else UpdateStatus("Gagal Simpan ke Galeri.");
+                    });
+                #else
+                    string path = Path.Combine(Application.persistentDataPath, fileName);
+                    File.WriteAllBytes(path, bytes);
+                    UpdateStatus("Tersimpan di Folder Data (Mode PC)");
+                #endif
+            }
+            else UpdateStatus("Gagal Download (Cek Koneksi).");
+        }
+    }
+
+    // --- LOGIKA FIREBASE ---
+    void InitializeFirebase()
+    {
+        FirebaseApp.CheckAndFixDependenciesAsync().ContinueWithOnMainThread(task => {
+            if (task.Result == DependencyStatus.Available) {
+                dbReference = FirebaseDatabase.GetInstance(FirebaseApp.DefaultInstance, databaseURL).RootReference;
+                isFirebaseReady = true;
+            }
+        });
+    }
+
+    void SaveToFirebase(int correct, int totalScore, bool status)
+    {
+        if (!isFirebaseReady || string.IsNullOrEmpty(walletAddress)) return;
+        string key = walletAddress; 
+        var data = new Dictionary<string, object> {
+            { "wallet", walletAddress }, { "correctCount", correct }, { "totalScore", totalScore }, { "isPassed", status }, { "timestamp", System.DateTime.UtcNow.ToString() }
+        };
+        dbReference.Child("Quiz_Results_10").Child(key).SetValueAsync(data);
+    }
+
+    // --- LOGIKA KUIS (YANG DIPERBAIKI) ---
+    public async void CheckBalanceAndStart()
+    {
+        UpdateStatus("Mengecek Data Blockchain...");
+        try
+        {
+            var wallet = ThirdwebManager.Instance.GetActiveWallet();
+            var address = await wallet.GetAddress();
+            var contract = await ThirdwebManager.Instance.GetContract(contractAddress, BigInteger.Parse(chainId));
+            var balance = await contract.Read<BigInteger>("balanceOf", address, BigInteger.Parse(tokenId));
+            
+            if (balance > 0) { UpdateStatus("Anda sudah punya sertifikat!"); ShowCertificate(); }
+            else { StartQuiz(); }
+        } 
+        catch { Debug.LogWarning("Offline Mode"); StartQuiz(); }
+    }
+
+    void StartQuiz()
+    {
+        currentQuestionIndex = 0; score = 0;
+        userAnswers = new int[questions.Count];
+        for (int i = 0; i < userAnswers.Length; i++) userAnswers[i] = -1;
+
+        // --- PERBAIKAN 1: Matikan Panel Menu Utama (Video/Kuis) ---
+        if (uiPanel) uiPanel.SetActive(false); // Supaya tombol Menu hilang dan layar bersih
+
+        // --- Pastikan Panel Kuis Aktif ---
+        if (quizPanel) quizPanel.SetActive(true);
+        
+        if (backButton) backButton.gameObject.SetActive(true);
+        if (answerKeyText) answerKeyText.gameObject.SetActive(false);
+        
+        ShowQuestion();
+    }
+
+    void ShowQuestion()
+    {
+        QuestionData q = questions[currentQuestionIndex];
+        questionText.text = q.question;
+        
+        // --- Pastikan Tombol Jawaban Muncul Saat Soal Tampil ---
+        for (int i = 0; i < answerButtons.Length; i++)
+        {
+            answerButtons[i].gameObject.SetActive(true); // Pastikan AKTIF
+            answerButtons[i].interactable = true;
+            TextMeshProUGUI btnText = answerButtons[i].GetComponentInChildren<TextMeshProUGUI>();
+            if (btnText != null) btnText.text = q.answers[i];
+        }
+        UpdateStatus("Soal " + (currentQuestionIndex + 1) + " / " + questions.Count);
+    }
+
+    void OnAnswerSelected(int index)
+    {
+        userAnswers[currentQuestionIndex] = index;
+        currentQuestionIndex++;
+        if (currentQuestionIndex < questions.Count) ShowQuestion();
+        else FinishQuiz();
+    }
+
+    void OnBackButtonClicked()
+    {
+        if (currentQuestionIndex > 0) 
+        { 
+            currentQuestionIndex--; 
+            ShowQuestion(); 
+        }
+    }
+
+    async void FinishQuiz()
+    {
+        // Matikan Back Button saat Finish
+        if (backButton) backButton.gameObject.SetActive(false);
+
+        // --- PERBAIKAN 2: Sembunyikan Tombol Jawaban Saat Skor Muncul ---
+        // Bukan cuma disable interactable, tapi matikan gameObject-nya
+        for (int i = 0; i < answerButtons.Length; i++) 
+        {
+            answerButtons[i].gameObject.SetActive(false); // NON-AKTIFKAN TOTAL
+        }
+
+        int correctCount = 0;
+        for (int i = 0; i < questions.Count; i++) { if (userAnswers[i] == questions[i].correctAnswer) correctCount++; }
+        score = correctCount * 10; bool isPassed = score >= 70;
+
+        SaveToFirebase(correctCount, score, isPassed);
+
+        if (scoreText) scoreText.text = "Skor Akhir: " + score;
+        string resultMsg = isPassed ? "SELAMAT! ANDA LULUS." : "MAAF, ANDA GAGAL.";
+        questionText.text = $"{resultMsg}\nSkor: {score}\n(Butuh 70 untuk Sertifikat)";
+
+        // --- TAMPILKAN KUNCI JAWABAN ---
+        if (answerKeyText)
+        {
+            string[] optionLabels = new string[] { "A", "B", "C", "D" };
+            
+            string generatedKey = "<margin-left=15%><b>KUNCI JAWABAN:</b>\n"; 
+            
+            for (int i = 0; i < questions.Count; i++)
+            {
+                int correctIdx = questions[i].correctAnswer;
+                generatedKey += $"{i + 1}.{optionLabels[correctIdx]}  ";
+                if ((i + 1) % 5 == 0) generatedKey += "\n"; 
+            }
+            generatedKey += "</margin>";
+
+            answerKeyText.text = generatedKey;
+            answerKeyText.gameObject.SetActive(true);
+        }
+
+        await Task.Delay(5000); 
+        if (quizPanel) quizPanel.SetActive(false);
+        
+        if (isPassed) ShowCertificate();
+        else if (uiPanel) uiPanel.SetActive(true); // Munculkan lagi menu utama kalau gagal
+    }
+
+    // --- UTILITIES ---
+    void ShowCertificate()
+    {
+        if (certificatePanel) certificatePanel.SetActive(true);
+        if (certImageDisplay && certificateSprite) certImageDisplay.sprite = certificateSprite;
+    }
+
+    void LockCursor() { Cursor.lockState = CursorLockMode.Locked; Cursor.visible = false; }
+    void OpenVideoLink() { Application.OpenURL(youtubeLink); }
+    public void CloseCertificatePanel() => certificatePanel.SetActive(false);
+    void UpdateStatus(string msg) { if (statusText) statusText.text = msg; }
+
+    private async void MonitorWalletConnection()
+    {
+        isMonitoringWallet = true;
+        while (isMonitoringWallet)
+        {
+            try
+            {
+                var address = await ThirdwebManager.Instance.GetActiveWallet().GetAddress();
+                if (!string.IsNullOrEmpty(address) && walletAddress != address)
+                {
+                    walletAddress = address;
+                    if (uiCamera) uiCamera.SetActive(false);
+                    if (gameWorld) gameWorld.SetActive(true);
+                }
+            } catch { }
+            if (!isMonitoringWallet) break;
+            await Task.Delay(1000);
+        }
+    }
+
+    private void OnTriggerEnter(Collider other)
+    {
+        if (other.CompareTag("Player")) { if (uiPanel) uiPanel.SetActive(true); Cursor.lockState = CursorLockMode.None; Cursor.visible = true; }
+    }
+
+    private void OnTriggerExit(Collider other)
+    {
+        if (other.CompareTag("Player")) { LockCursor(); if (uiPanel) uiPanel.SetActive(false); }
+    }
+
+    void LoadHardcodedQuestions()
+    {
+        questions.Clear();
+        questions.Add(new QuestionData { question = "Setarakan: Fe2O3 + 3CO -> ...", answers = new string[] { "2Fe + 3CO2", "Fe + 3CO2", "2Fe + CO2", "Fe + CO2" }, correctAnswer = 0 });
+        questions.Add(new QuestionData { question = "Setarakan: N2 + 3H2 -> ...", answers = new string[] { "2NH3", "NH3", "3NH3", "2NH2" }, correctAnswer = 0 });
+        questions.Add(new QuestionData { question = "Setarakan: 2H2 + O2 -> ...", answers = new string[] { "2H2O", "H2O", "2HO", "H2O2" }, correctAnswer = 0 });
+        questions.Add(new QuestionData { question = "Setarakan: Mg + O2 -> MgO", answers = new string[] { "Mg + O2 -> MgO", "Mg + O2 -> 2MgO", "2Mg + O2 -> 2MgO", "2Mg + 2O2 -> 2MgO" }, correctAnswer = 2 });
+        questions.Add(new QuestionData { question = "Setarakan: Al + O2 -> Al2O3", answers = new string[] { "4Al + 3O2 -> 2Al2O3", "2Al + 3O2 -> Al2O3", "4Al + O2 -> 2Al2O3", "2Al + O2 -> Al2O3" }, correctAnswer = 0 });
+        questions.Add(new QuestionData { question = "Setarakan: C3H8 + O2 -> CO2 + H2O", answers = new string[] { "C3H8 + 5O2 -> 3CO2 + 4H2O", "C3H8 + 2O2 -> 3CO2 + 4H2O", "2C3H8 + 5O2 -> 3CO2 + 4H2O", "C3H8 + 5O2 -> CO2 + H2O" }, correctAnswer = 0 });
+        questions.Add(new QuestionData { question = "Setarakan: P4 + O2 -> P2O5", answers = new string[] { "P4 + O2 -> P2O5", "P4 + 5O2 -> 2P2O5", "2P4 + 5O2 -> 2P2O5", "P4 + 3O2 -> 2P2O5" }, correctAnswer = 1 });
+        questions.Add(new QuestionData { question = "Setarakan: KClO3 -> KCl + O2", answers = new string[] { "KClO3 -> KCl + O2", "2KClO3 -> 2KCl + 3O2", "KClO3 -> KCl + 3O2", "2KClO3 -> 2KCl + O2" }, correctAnswer = 1 });
+        questions.Add(new QuestionData { question = "Setarakan: NaOH + H2SO4 -> Na2SO4 + H2O", answers = new string[] { "2NaOH + H2SO4 -> Na2SO4 + 2H2O", "NaOH + H2SO4 -> Na2SO4 + H2O", "NaOH + 2H2SO4 -> Na2SO4 + 2H2O", "2NaOH + H2SO4 -> Na2SO4 + 2H2O" }, correctAnswer = 0 });
+        questions.Add(new QuestionData { question = "Setarakan: CH4 + 2O2 -> ...", answers = new string[] { "CO + H2O", "CO2 + 2H2O", "CO2 + H2O", "2CO2 + 2H2O" }, correctAnswer = 1 });
+    }
+}
