@@ -1,0 +1,301 @@
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Thirdweb;
+using Thirdweb.Unity;
+using Firebase;
+using Firebase.Database;
+using Firebase.Extensions;
+
+// =======================================================
+// PUBLIC SUBMISSION VERSION
+// Sensitive keys and endpoints are intentionally masked
+// Backend features disabled in public mode
+// =======================================================
+
+[System.Serializable]
+public class QuestionData
+{
+    [TextArea] public string question;
+    public string[] answers;
+    public int correctAnswer;
+}
+
+public class GameManager : MonoBehaviour
+{
+    [Header("PUBLIC MODE")]
+    public bool isPublicVersion = true;
+
+    [Header("AI (Gemini)")]
+    public string geminiApiKey = "YOUR_API_KEY";
+    private const string GEMINI_URL =
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+    [Header("NFT / Blockchain")]
+    public string contractAddress = "YOUR_CONTRACT_ADDRESS";
+    public string chainId = "11155111";
+    public string tokenId = "0";
+
+    [Header("Firebase")]
+    private string databaseURL = "YOUR_FIREBASE_DATABASE_URL";
+
+    [Header("UI")]
+    public GameObject uiCamera;
+    public GameObject gameWorld;
+    public GameObject uiPanel;
+    public GameObject quizPanel;
+    public GameObject certificatePanel;
+
+    [Header("Quiz UI")]
+    public Button startQuizButton;
+    public TextMeshProUGUI questionText;
+    public Button[] answerButtons;
+    public TextMeshProUGUI statusText;
+    public TextMeshProUGUI scoreText;
+
+    [Header("Certificate")]
+    public Image certImageDisplay;
+    public Sprite certificateSprite;
+    public Button closeButton;
+    public Button downloadButton;
+
+    // ================= INTERNAL =================
+    private List<QuestionData> questions = new List<QuestionData>();
+    private int currentQuestionIndex;
+    private int score;
+    private float timePerQuestion = 120f;
+    private float currentTimer;
+    private bool isTimerRunning;
+
+    private DatabaseReference dbReference;
+    private string walletAddress = "";
+
+    // ================= START =================
+    void Start()
+    {
+        SafeSetActive(uiCamera, true);
+        SafeSetActive(gameWorld, false);
+        SafeSetActive(uiPanel, false);
+        SafeSetActive(quizPanel, false);
+        SafeSetActive(certificatePanel, false);
+
+        SetupButtons();
+        LoadHardcodedQuestions();
+        LockCursor();
+
+        if (!isPublicVersion)
+        {
+            InitializeFirebase();
+            MonitorWalletConnection();
+        }
+        else
+        {
+            UpdateStatus("Public submission version (backend disabled)");
+            SafeSetActive(uiPanel, true);
+        }
+    }
+
+    void Update()
+    {
+        if (!isTimerRunning) return;
+
+        currentTimer -= Time.deltaTime;
+        if (currentTimer <= 0)
+        {
+            isTimerRunning = false;
+            NextQuestion();
+        }
+    }
+
+    // ================= UTIL =================
+    void SafeSetActive(GameObject obj, bool value)
+    {
+        if (obj) obj.SetActive(value);
+    }
+
+    string MaskWallet(string address)
+    {
+        if (string.IsNullOrEmpty(address) || address.Length < 8)
+            return address;
+
+        return address.Substring(0, 4) + "***********" +
+               address.Substring(address.Length - 3);
+    }
+
+    void UpdateStatus(string msg)
+    {
+        if (statusText) statusText.text = msg;
+    }
+
+    void LockCursor()
+    {
+        Cursor.lockState = CursorLockMode.Locked;
+        Cursor.visible = false;
+    }
+
+    // ================= BUTTONS =================
+    void SetupButtons()
+    {
+        if (startQuizButton)
+            startQuizButton.onClick.AddListener(StartQuiz);
+
+        if (closeButton)
+            closeButton.onClick.AddListener(() => SafeSetActive(certificatePanel, false));
+
+        if (downloadButton)
+            downloadButton.onClick.AddListener(OnDownloadClicked);
+
+        if (answerButtons != null)
+        {
+            for (int i = 0; i < answerButtons.Length; i++)
+            {
+                int idx = i;
+                answerButtons[i].onClick.AddListener(() => OnAnswerSelected(idx));
+            }
+        }
+    }
+
+    // ================= QUIZ =================
+    void StartQuiz()
+    {
+        currentQuestionIndex = 0;
+        score = 0;
+
+        SafeSetActive(uiPanel, false);
+        SafeSetActive(quizPanel, true);
+
+        ShowQuestion();
+    }
+
+    void ShowQuestion()
+    {
+        if (currentQuestionIndex >= questions.Count)
+        {
+            FinishQuiz();
+            return;
+        }
+
+        currentTimer = timePerQuestion;
+        isTimerRunning = true;
+
+        var q = questions[currentQuestionIndex];
+        if (questionText) questionText.text = q.question;
+
+        for (int i = 0; i < answerButtons.Length; i++)
+        {
+            var txt = answerButtons[i].GetComponentInChildren<TextMeshProUGUI>();
+            if (txt) txt.text = q.answers[i];
+            answerButtons[i].image.color = Color.white;
+        }
+
+        UpdateStatus($"Soal {currentQuestionIndex + 1}/{questions.Count}");
+    }
+
+    void OnAnswerSelected(int index)
+    {
+        if (questions[currentQuestionIndex].correctAnswer == index)
+            score += 10;
+
+        NextQuestion();
+    }
+
+    void NextQuestion()
+    {
+        currentQuestionIndex++;
+        ShowQuestion();
+    }
+
+    async void FinishQuiz()
+    {
+        isTimerRunning = false;
+        SafeSetActive(quizPanel, false);
+
+        if (scoreText)
+        {
+            scoreText.gameObject.SetActive(true);
+            scoreText.text = "Skor Akhir: " + score;
+        }
+
+        await Task.Delay(2000);
+
+        if (score >= 70)
+            ShowCertificate();
+        else
+            StartQuiz();
+    }
+
+    // ================= CERTIFICATE =================
+    void ShowCertificate()
+    {
+        SafeSetActive(certificatePanel, true);
+        if (certImageDisplay)
+            certImageDisplay.sprite = certificateSprite;
+    }
+
+    void OnDownloadClicked()
+    {
+        UpdateStatus("Download disabled (public version)");
+    }
+
+    // ================= FIREBASE =================
+    void InitializeFirebase()
+    {
+        FirebaseApp.CheckAndFixDependenciesAsync()
+            .ContinueWithOnMainThread(task =>
+            {
+                if (task.Result == DependencyStatus.Available)
+                {
+                    dbReference = FirebaseDatabase
+                        .GetInstance(FirebaseApp.DefaultInstance, databaseURL)
+                        .RootReference;
+                }
+            });
+    }
+
+    // ================= WALLET =================
+    async void MonitorWalletConnection()
+    {
+        while (true)
+        {
+            try
+            {
+                var addr = await ThirdwebManager.Instance
+                    .GetActiveWallet()
+                    .GetAddress();
+
+                if (!string.IsNullOrEmpty(addr))
+                {
+                    walletAddress = addr;
+                    SafeSetActive(uiCamera, false);
+                    SafeSetActive(gameWorld, true);
+                    UpdateStatus("Wallet: " + MaskWallet(addr));
+                    break;
+                }
+            }
+            catch { }
+
+            await Task.Delay(1000);
+        }
+    }
+
+    // ================= QUESTIONS =================
+    void LoadHardcodedQuestions()
+    {
+        questions.Clear();
+
+        questions.Add(new QuestionData
+        {
+            question = "Setarakan reaksi: N₂ + H₂ → NH₃",
+            answers = new[]
+            {
+                "N₂ + 3H₂ → 2NH₃",
+                "N₂ + H₂ → NH₃",
+                "2N₂ + H₂ → 2NH₃",
+                "N₂ + 2H₂ → NH₃"
+            },
+            correctAnswer = 0
+        });
+    }
+}
